@@ -85,7 +85,7 @@ async function handleRequest(event) {
 }
 
 async function handleUrlUpload(request) {
-  const { url, authKey } = await request.json();
+  const { url, authKey, deletionTimestamp } = await request.json();
   if (!url || !authKey) {
     return new Response('Bad Request', { status: 400, headers: headersCORS });
   }
@@ -104,7 +104,9 @@ async function handleUrlUpload(request) {
     const hash = nanoid();
     const contentType = fileResponse.headers.get('Content-Type') || 'application/octet-stream';
     const originalName = url.split('/').pop();
-    const deletionTimestamp = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+
+    // Use provided deletionTimestamp or default to 24 hours from now
+    const expiryTimestamp = deletionTimestamp ? parseInt(deletionTimestamp) : Date.now() + 24 * 60 * 60 * 1000;
 
     await CDN_BUCKET.put(`tempupload/content/${hash}`, fileBlob.stream(), {
       httpMetadata: { contentType },
@@ -117,14 +119,14 @@ async function handleUrlUpload(request) {
       hash,
       contentType,
       originalName,
-      deletionTimestamp,
+      deletionTimestamp: expiryTimestamp,
     });
 
     await CDN_BUCKET.put('tempupload/index.json', JSON.stringify(index), {
       httpMetadata: { contentType: 'application/json' },
     });
 
-    return new Response(JSON.stringify({ downloadLink: `https://fileshare.jonasjones.dev/download/${hash}` }), {
+    return new Response(JSON.stringify({ downloadLink: `/download/${hash}` }), {
       headers: { 'Content-Type': 'application/json', ...headersCORS },
     });
   } catch (error) {
@@ -133,25 +135,24 @@ async function handleUrlUpload(request) {
 }
 
 async function cleanUpExpiredFiles() {
-  const indexData = await CDN_BUCKET.get('/tempupload/index.json');
+  const indexData = await CDN_BUCKET.get('tempupload/index.json');
   if (!indexData) {
     return;
   }
 
   let index = await indexData.json();
-  const now = Date.now();
   const updatedIndex = [];
 
-  for (const fileRecord of index) {
-    if (fileRecord.deletionTimestamp <= now) {
-      await CDN_BUCKET.delete(`/tempupload/content/${fileRecord.hash}`);
+  for (fileRecord of index) {
+    if (fileRecord.deletionTimestamp <= Date.now()) {
+      await CDN_BUCKET.delete(`tempupload/content/${fileRecord.hash}`);
     } else {
       updatedIndex.push(fileRecord);
     }
   }
 
   if (updatedIndex.length !== index.length) {
-    await CDN_BUCKET.put('/tempupload/index.json', JSON.stringify(updatedIndex), {
+    await CDN_BUCKET.put('tempupload/index.json', JSON.stringify(updatedIndex), {
       httpMetadata: { contentType: 'application/json' },
     });
   }
@@ -165,6 +166,8 @@ async function handleUpload(request) {
 
   const formData = await request.formData();
   const file = formData.get('file');
+  const deletionTimestamp = formData.get('deletionTimestamp');
+  console.log('deletionTimestamp:', deletionTimestamp);
   if (!file) {
     return new Response('Bad Request', { status: 400, headers: headersCORS });
   }
@@ -172,7 +175,8 @@ async function handleUpload(request) {
   const hash = nanoid();
   const contentType = file.type;
   const originalName = file.name;
-  const deletionTimestamp = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+
+  const expiryTimestamp = deletionTimestamp ? parseInt(deletionTimestamp) : Date.now() + 7 * 24 * 60 * 60 * 1000;
 
   await CDN_BUCKET.put(`tempupload/content/${hash}`, file.stream(), {
     httpMetadata: { contentType },
@@ -185,7 +189,7 @@ async function handleUpload(request) {
     hash,
     contentType,
     originalName,
-    deletionTimestamp,
+    deletionTimestamp: expiryTimestamp,
   });
 
   await CDN_BUCKET.put('tempupload/index.json', JSON.stringify(index), {
@@ -289,6 +293,9 @@ const htmlForm = `
   <form id="uploadForm">
     <input type="file" id="fileInput" name="file" required>
     <input type="password" id="authKey" placeholder="Enter password" required>
+    <label for="deletionDate">Deletion Date (select date or leave blank for 7 days from now):</label>
+    <input type="date" id="deletionDate">
+    <input type="checkbox" id="defaultSevenDays"> Set to delete 7 days from now
     <button type="submit">Upload</button>
   </form>
   <div id="uploadResponse"></div>
@@ -297,6 +304,9 @@ const htmlForm = `
   <form id="urlUploadForm">
     <input type="url" id="fileUrl" placeholder="Enter file URL" required>
     <input type="password" id="urlAuthKey" placeholder="Enter password" required>
+    <label for="urlDeletionDate">Deletion Date (select date or leave blank for 7 days from now):</label>
+    <input type="date" id="urlDeletionDate">
+    <input type="checkbox" id="urlDefaultSevenDays"> Set to delete 7 days from now
     <button type="submit">Upload</button>
   </form>
   <div id="urlUploadResponse"></div>
@@ -316,7 +326,7 @@ const htmlForm = `
     <thead>
       <tr>
         <th>Original Name</th>
-        <th>Deletion Timestamp</th>
+        <th>Deletion Date</th>
         <th>Download Link (Hash)</th>
       </tr>
     </thead>
@@ -324,6 +334,20 @@ const htmlForm = `
   </table>
 
   <script>
+    // Calculate 7 days from now in Unix milliseconds
+    function getSevenDaysFromNow() {
+      const now = new Date();
+      return roundToNextDay(now.getTime() + 8 * 24 * 60 * 60 * 1000);
+    }
+
+    // Round to start of next day
+    function roundToNextDay(timestamp) {
+      const date = new Date(timestamp);
+      date.setHours(24, 0, 0, 0); // Set to 00:00:00 the following day
+      return date.getTime() - 24 * 60 * 60 * 1000;
+    }
+
+    // Handle form submission for file upload
     document.getElementById('uploadForm').addEventListener('submit', async (e) => {
       e.preventDefault();
 
@@ -332,11 +356,24 @@ const htmlForm = `
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
 
+      let deletionTimestamp;
+      const deletionDate = document.getElementById('deletionDate').value;
+      const useSevenDays = document.getElementById('defaultSevenDays').checked;
+
+      if (useSevenDays) {
+        deletionTimestamp = getSevenDaysFromNow();
+      } else if (deletionDate) {
+        deletionTimestamp = new Date(deletionDate).getTime();
+        deletionTimestamp = roundToNextDay(deletionTimestamp);
+      }
+
+      formData.append('deletionTimestamp', deletionTimestamp);
+
       const responseElement = document.getElementById('uploadResponse');
       responseElement.textContent = 'Uploading...';
 
       try {
-        const response = await fetch('https://fileshare.jonasjones.dev/upload', {
+        const response = await fetch('/upload', {
           method: 'POST',
           headers: {
             'X-Custom-Auth-Key': \`Bearer \${authKey}\`
@@ -353,22 +390,35 @@ const htmlForm = `
       }
     });
 
+    // Handle form submission for URL upload
     document.getElementById('urlUploadForm').addEventListener('submit', async (e) => {
       e.preventDefault();
 
       const fileUrl = document.getElementById('fileUrl').value;
       const authKey = document.getElementById('urlAuthKey').value;
+
+      let deletionTimestamp;
+      const deletionDate = document.getElementById('urlDeletionDate').value;
+      const useSevenDays = document.getElementById('urlDefaultSevenDays').checked;
+
+      if (useSevenDays) {
+        deletionTimestamp = getSevenDaysFromNow();
+      } else if (deletionDate) {
+        deletionTimestamp = new Date(deletionDate).getTime();
+        deletionTimestamp = roundToNextDay(deletionTimestamp);
+      }
+
       const responseElement = document.getElementById('urlUploadResponse');
       responseElement.textContent = 'Downloading and uploading...';
 
       try {
-        const response = await fetch('https://fileshare.jonasjones.dev/upload-url', {
+        const response = await fetch('\/upload-url', {
           method: 'POST',
           headers: {
             'X-Custom-Auth-Key': \`Bearer \${authKey}\`,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ url: fileUrl, authKey: \`Bearer \${authKey}\` })
+          body: JSON.stringify({ url: fileUrl, authKey: \`Bearer \${authKey}\`, deletionTimestamp })
         });
 
         const result = await response.json();
@@ -380,6 +430,7 @@ const htmlForm = `
       }
     });
 
+    // Handle file deletion
     document.getElementById('deleteForm').addEventListener('submit', async (e) => {
       e.preventDefault();
 
@@ -391,7 +442,7 @@ const htmlForm = `
       responseElement.textContent = 'Deleting...';
 
       try {
-        const response = await fetch(\`https://fileshare.jonasjones.dev/delete/\${fileHash}\`, {
+        const response = await fetch(\`\/delete/\${fileHash}\`, {
           method: 'DELETE',
           headers: {
             'X-Custom-Auth-Key': \`Bearer \${authKey}\`
@@ -407,6 +458,7 @@ const htmlForm = `
       }
     });
 
+    // Fetch file list for deletion dropdown
     async function fetchFileList() {
       try {
         const response = await fetch('https://cdn.jonasjones.dev/tempupload/index.json');
@@ -415,7 +467,7 @@ const htmlForm = `
         fileSelect.innerHTML = '<option value="">Select a file to delete</option>';
         files.forEach(file => {
           const option = document.createElement('option');
-          const deletionDate = new Date(file.deletionTimestamp).toLocaleString();
+          const deletionDate = new Date(file.deletionTimestamp).toLocaleDateString();
           option.value = file.hash;
           option.textContent = \`\${file.originalName} (deletes on \${deletionDate}) - \${file.hash}\`;
           fileSelect.appendChild(option);
@@ -425,6 +477,7 @@ const htmlForm = `
       }
     }
 
+    // Fetch and display file table
     async function fetchFileTable() {
       try {
         const response = await fetch('https://cdn.jonasjones.dev/tempupload/index.json');
@@ -433,11 +486,11 @@ const htmlForm = `
         fileTableBody.innerHTML = '';
         files.forEach(file => {
           const row = document.createElement('tr');
-          const deletionDate = new Date(file.deletionTimestamp).toLocaleString();
+          const deletionDate = new Date(file.deletionTimestamp).toLocaleDateString();
           row.innerHTML = \`
             <td>\${file.originalName}</td>
             <td>\${deletionDate}</td>
-            <td><a href="https://fileshare.jonasjones.dev/download/\${file.hash}">\${file.hash}</a></td>
+            <td><a href="\/download/\${file.hash}">\${file.hash}</a></td>
           \`;
           fileTableBody.appendChild(row);
         });
