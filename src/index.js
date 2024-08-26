@@ -97,7 +97,7 @@ async function handleUrlUpload(request) {
   try {
     const fileResponse = await fetch(url);
     if (!fileResponse.ok) {
-      throw new Error('Failed to fetch the file');
+      return new Response('Failed to download file', { status: 500, headers: headersCORS });
     }
 
     const fileBlob = await fileResponse.blob();
